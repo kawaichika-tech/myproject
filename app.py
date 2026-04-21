@@ -804,6 +804,18 @@ def build_chubun_lookup(pdf_bytes: bytes) -> dict:
     """
     lookup = {}
 
+    # CubePDF等で作成されたPDFに対応するため複数の設定を試みる
+    table_strategies = [
+        {"vertical_strategy": "lines", "horizontal_strategy": "lines",
+         "snap_tolerance": 5, "join_tolerance": 3, "intersection_tolerance": 5},
+        {"vertical_strategy": "lines", "horizontal_strategy": "lines",
+         "snap_tolerance": 10, "join_tolerance": 5, "intersection_tolerance": 10},
+        {"vertical_strategy": "text", "horizontal_strategy": "lines",
+         "snap_tolerance": 5, "join_tolerance": 3},
+        {"vertical_strategy": "lines", "horizontal_strategy": "text",
+         "snap_tolerance": 5, "join_tolerance": 3},
+    ]
+
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             # 物件名は extract_text から取得（新築工事を含む行を優先）
@@ -812,7 +824,19 @@ def build_chubun_lookup(pdf_bytes: bytes) -> dict:
             if m and "_物件名" not in lookup:
                 lookup["_物件名"] = m.group(0).strip()
 
-            for table in page.extract_tables():
+            # テーブルを抽出（複数戦略を試みて最も行数が多いものを採用）
+            best_tables = []
+            for strategy in table_strategies:
+                try:
+                    tables = page.extract_tables(table_settings=strategy)
+                    total_rows = sum(len(t) for t in tables)
+                    best_total = sum(len(t) for t in best_tables)
+                    if total_rows > best_total:
+                        best_tables = tables
+                except Exception:
+                    continue
+
+            for table in best_tables:
                 current_ext_sec = ""
                 current_int_sec = ""
 
@@ -845,28 +869,32 @@ def build_chubun_lookup(pdf_bytes: bytes) -> dict:
                             if ext_l3 not in lookup:
                                 lookup[ext_l3] = ext_val
 
-                    # 内部項目: col9 → セクション名, col10 → ラベル, col11 → サブラベル, col12+col13+col14 → 値
-                    int_sec_raw = cells[9]
-                    int_label   = cells[10]
-                    int_sublbl  = cells[11]
-                    int_val     = " ".join(filter(None, [cells[12], cells[13], cells[14]])).strip()
+                    # 内部項目: col8 → セクション名, col9 → ラベル, col10 → サブラベル, col11+col12+col13 → 値
+                    int_sec_raw = cells[8]
+                    int_label   = cells[9]
+                    int_sublbl  = cells[10]
+                    int_val     = " ".join(filter(None, [cells[11], cells[12], cells[13]])).strip()
 
                     # セクション名はマージセルで空になる場合があるので持続させる
                     if int_sec_raw:
                         current_int_sec = int_sec_raw
 
-                    if int_label and int_val:
+                    # col9が空でcol10に値がある場合（ラベルがサブラベル列にある構造）に対応
+                    eff_label  = int_label or int_sublbl
+                    eff_sublbl = int_sublbl if int_label else ""
+
+                    if eff_label and int_val:
                         # セクション+ラベルで保存
                         if current_int_sec:
-                            lookup[f"{current_int_sec} {int_label}"] = int_val
-                        # ラベル+サブラベルで保存（より具体的なキー）
-                        if int_sublbl:
-                            key_sub = f"{int_label} {int_sublbl}"
+                            lookup[f"{current_int_sec} {eff_label}"] = int_val
+                        # ラベル+サブラベルで保存
+                        if eff_sublbl:
+                            key_sub = f"{eff_label} {eff_sublbl}"
                             if key_sub not in lookup:
                                 lookup[key_sub] = int_val
                         # ラベル単体でも保存（先着優先）
-                        if int_label not in lookup:
-                            lookup[int_label] = int_val
+                        if eff_label not in lookup:
+                            lookup[eff_label] = int_val
 
     return lookup
 
@@ -892,6 +920,12 @@ def check_specification_chubun(lookup: dict, config: dict) -> tuple[list, list, 
 
     def g(key):
         return lookup.get(key, "").strip()
+
+    def g_partial(section_kw: str, label: str) -> str:
+        for k, v in lookup.items():
+            if section_kw in k and label in k:
+                return v.strip()
+        return ""
 
     # ========== 玄関ドア ==========
     door_name    = g("玄関ドア 商品名・種類")
@@ -1034,7 +1068,8 @@ def check_specification_chubun(lookup: dict, config: dict) -> tuple[list, list, 
         passes.append(f"雨樋（竪樋・呼樋）: {tate_info}")
 
     # ========== 外部サッシ色 ==========
-    sash_color = g("外部サッシ色・勝手口 色")
+    sash_color = (g("外部サッシ色・勝手口 色") or g("外部サッシ色 色")
+                  or g_partial("外部サッシ色", "色"))
     if not sash_color:
         errors.append({"項目": "外部サッシ色", "ルール": "外部サッシ色を記載すること",
                        "現状": "記載なし", "理由": "外部サッシ色が未記載です"})
@@ -1076,9 +1111,9 @@ def check_specification_chubun(lookup: dict, config: dict) -> tuple[list, list, 
         passes.append("ガレージシャッター: 対象外")
 
     # ========== 内部土間仕上げ ==========
-    tile_maker  = g("メーカー")
-    tile_name   = g("商品名")
-    tile_hinban = g("品番")
+    tile_maker  = g_partial("内部土間仕上げ", "メーカー") or g("メーカー")
+    tile_name   = g_partial("内部土間仕上げ", "商品名") or g("商品名")
+    tile_hinban = g_partial("内部土間仕上げ", "品番") or g("品番")
 
     for label, val in [("メーカー", tile_maker), ("商品名", tile_name), ("品番", tile_hinban)]:
         if not val:
@@ -1089,7 +1124,8 @@ def check_specification_chubun(lookup: dict, config: dict) -> tuple[list, list, 
             passes.append(f"内部土間仕上げ（{label}）: {val}")
 
     # ========== 内部サッシ色 ==========
-    naibusasshi_color = g("内部サッシ色 色") or g("内部サッシ色")
+    naibusasshi_color = (g("内部サッシ色 色") or g("内部サッシ色")
+                         or g_partial("内部サッシ色", "色"))
     if not naibusasshi_color:
         errors.append({"項目": "内部サッシ色", "ルール": "内部サッシ色を記載すること",
                        "現状": "記載なし", "理由": "内部サッシ色が未記載です"})
@@ -1097,8 +1133,8 @@ def check_specification_chubun(lookup: dict, config: dict) -> tuple[list, list, 
         passes.append(f"内部サッシ色: {naibusasshi_color}")
 
     # ========== 巾木 ==========
-    habaki_hinban = g("巾木 品番")
-    habaki_color  = g("巾木 色")
+    habaki_hinban = g("巾木 品番") or g_partial("巾木", "品番")
+    habaki_color  = g("巾木 色") or g_partial("巾木", "色")
     if not habaki_hinban:
         errors.append({"項目": "巾木（品番）", "ルール": "巾木の品番を記載すること",
                        "現状": "記載なし", "理由": "巾木の品番が未記載です"})
@@ -1302,6 +1338,7 @@ with tab_chubun:
             is_boka_area    = st.checkbox("防火・準防火地域")
 
         st.divider()
+        debug_mode = st.checkbox("🔧 デバッグモード（テーブル構造を表示）", key="debug_mode")
         st.subheader("📂 外部・内部仕様一覧表（注文）")
         uploaded_chubun = st.file_uploader(
             "仕様書PDFをドラッグ＆ドロップ", type=["pdf"], key="chubun"
@@ -1326,12 +1363,55 @@ with tab_chubun:
                 }
 
                 pdf_bytes = uploaded_chubun.read()
+                st.info(f"PDFサイズ: {len(pdf_bytes):,} バイト")
                 with st.spinner("📄 仕様書を解析中..."):
-                    lookup = build_chubun_lookup(pdf_bytes)
+                    try:
+                        lookup = build_chubun_lookup(pdf_bytes)
+                    except Exception as _build_err:
+                        st.error(f"解析例外: {_build_err}")
+                        lookup = {}
+
+                if st.session_state.get("debug_mode"):
+                    st.subheader("🔧 デバッグ: lookup辞書の内容")
+                    st.text(f"lookup件数: {len(lookup)}")
+                    for k, v in sorted(lookup.items()):
+                        st.text(f"{k!r}: {v!r}")
+                    st.divider()
+                    st.subheader("🔧 デバッグ: 生テーブル行（先頭3ページ）")
+                    import io as _io
+                    import pdfplumber as _pp
+                    with _pp.open(_io.BytesIO(pdf_bytes)) as _pdf:
+                        for _pi, _page in enumerate(_pdf.pages[:3]):
+                            page_text = _page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                            st.text(f"--- ページ{_pi+1} テキスト先頭200文字 ---")
+                            st.text(page_text[:200])
+                            tables = _page.extract_tables()
+                            st.text(f"テーブル数: {len(tables)}")
+                            for _ti, _table in enumerate(tables):
+                                st.text(f"  テーブル{_ti+1}: {len(_table)}行")
+                                for _row in _table[:20]:
+                                    if _row and any(c for c in _row if c):
+                                        st.text(str([str(c or "").strip() for c in _row]))
 
                 if not lookup:
-                    st.error("PDFからテキストを抽出できませんでした。")
+                    st.error("【v3】PDFからデータを取得できませんでした。")
+                    try:
+                        with pdfplumber.open(io.BytesIO(pdf_bytes)) as _pdf2:
+                            for _pi2, _page2 in enumerate(_pdf2.pages[:2]):
+                                raw2 = _page2.extract_text(x_tolerance=3, y_tolerance=3) or ""
+                                tbls2 = _page2.extract_tables() or []
+                                st.info(f"ページ{_pi2+1}: テキスト{len(raw2)}文字 / テーブル{len(tbls2)}個")
+                                if raw2:
+                                    st.text(f"テキスト先頭: {raw2[:200]}")
+                                for _ti2, _t2 in enumerate(tbls2[:2]):
+                                    st.text(f"テーブル{_ti2+1}: {len(_t2)}行")
+                                    for _r2 in (_t2 or [])[:5]:
+                                        if _r2 and any(c for c in _r2 if c):
+                                            st.text(str([str(c or "").strip() for c in _r2]))
+                    except Exception as _e2:
+                        st.error(f"診断エラー: {_e2}")
                 else:
+
                     errors, passes, meta = check_specification_chubun(lookup, config)
                     result = format_report_chubun(errors, passes, meta)
 
