@@ -23,14 +23,84 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
 # ============================================================
 # 汎用ヘルパー
 # ============================================================
-def find_value_after(text: str, label: str, stop_chars: int = 80) -> str:
-    """ラベルの直後の値を返す"""
+_LABEL_SKIP = {"商品名", "品番", "カラー", "色", "メーカー", "種類", "型番",
+               "材料", "張り方向", "備考", "決定", "選択", "メイン", "貼り分け",
+               "ー", "-", ""}
+
+
+def find_value_after(text: str, label: str, stop_chars: int = 200) -> str:
+    """ラベルの直後の値を返す。テーブルの '|' 区切りや空セルを考慮して、
+    ラベルではない最初の有効値を返す。"""
     idx = text.find(label)
     if idx == -1:
         return ""
     after = text[idx + len(label):idx + len(label) + stop_chars]
-    val = re.split(r'[\n\|]', after)[0].strip()
-    return val if val not in ["ー", "-", ""] else ""
+    line = after.split("\n")[0]
+    parts = [p.strip() for p in line.split("|")]
+    for p in parts:
+        if p and p not in _LABEL_SKIP and "【" not in p:
+            return p
+    return ""
+
+
+def find_value_in_table(text: str, label: str) -> str:
+    """ラベルを含むテーブル行を探して値を返す。
+    1) 同じ行に '... | label | value | ...' → label の直後の有効セル
+    2) 横並びヘッダー '... | label1 | label2 | ...' の場合 → 次の行の同じ列
+    3) ラベルの後に同じ行で別ラベルが続く場合 → ラベル位置から数えて同じインデックスの値セル
+    """
+    lines = text.split("\n")
+    for i, line in enumerate(lines):
+        if label not in line:
+            continue
+        if "|" not in line:
+            after = line.split(label, 1)[1].lstrip(":：\t 　").strip()
+            if after and after not in _LABEL_SKIP and "【" not in after:
+                first = re.split(r'[\s　]+', after)[0]
+                if first and first not in _LABEL_SKIP:
+                    return first
+            continue
+
+        cells = [c.strip() for c in line.split("|")]
+        label_col = -1
+        for j, c in enumerate(cells):
+            if c == label:
+                label_col = j
+                break
+        if label_col == -1:
+            continue
+
+        # 形式1: ラベル直後のセルが値
+        if label_col + 1 < len(cells):
+            v = cells[label_col + 1]
+            if v and v not in _LABEL_SKIP and "【" not in v:
+                return v
+
+        # 形式2: 次の行の同じ列
+        if i + 1 < len(lines) and "|" in lines[i + 1]:
+            next_cells = [c.strip() for c in lines[i + 1].split("|")]
+            if label_col < len(next_cells):
+                v = next_cells[label_col]
+                if v and v not in _LABEL_SKIP and "【" not in v:
+                    return v
+
+        # 形式3: 横並びの複数ラベル（label1 | label2 | label3 | val1 | val2 | val3）
+        # ラベルが連続するセル数を数えて、同じ相対位置の値を取る
+        label_seq_start = label_col
+        while label_seq_start > 0 and cells[label_seq_start - 1] in _LABEL_SKIP - {"", "ー", "-"}:
+            label_seq_start -= 1
+        label_seq_end = label_col
+        while label_seq_end + 1 < len(cells) and cells[label_seq_end + 1] in _LABEL_SKIP - {"", "ー", "-"}:
+            label_seq_end += 1
+        label_count = label_seq_end - label_seq_start + 1
+        offset = label_col - label_seq_start
+        # 値は label_seq_end の後ろから始まると仮定し、同じoffsetを取る
+        val_idx = label_seq_end + 1 + offset
+        if val_idx < len(cells):
+            v = cells[val_idx]
+            if v and v not in _LABEL_SKIP and "【" not in v:
+                return v
+    return ""
 
 def search_pattern(text: str, pattern: str) -> str:
     """正規表現で最初のマッチを返す"""
@@ -454,17 +524,19 @@ def check_specification(text: str) -> tuple[list, list, dict]:
                     tile_maker = m.group(1).strip()
                     break
 
-    # 商品名
-    tile_name = find_value_after(tile_block, "商品名")
+    # 商品名（テーブル形式優先）
+    tile_name = find_value_in_table(tile_block, "商品名") or find_value_after(tile_block, "商品名")
     if not tile_name:
-        m = re.search(r'内部土間タイル.{0,200}?商品名\s*([^\|\n]{2,30})', text, re.DOTALL)
+        m = re.search(r'内部土間タイル.{0,300}?商品名[\s\|：:]+([^\|\n]{2,30})', text, re.DOTALL)
         if m:
-            tile_name = m.group(1).strip().split("|")[0].strip()
+            cand = m.group(1).strip()
+            if cand not in _LABEL_SKIP:
+                tile_name = cand
 
-    # 品番
-    tile_hinban = find_value_after(tile_block, "品番")
+    # 品番（テーブル形式優先）
+    tile_hinban = find_value_in_table(tile_block, "品番") or find_value_after(tile_block, "品番")
     if not tile_hinban:
-        m = re.search(r'([A-Z]{2,3}-\d{2,3}-?\d*)', tile_block)
+        m = re.search(r'([A-Z]{2,3}-\d{2,3}[-\d]*)', tile_block)
         tile_hinban = m.group(1) if m else ""
 
     if not tile_maker:
@@ -486,28 +558,57 @@ def check_specification(text: str) -> tuple[list, list, dict]:
         passes.append(f"内部土間タイル（品番）: {tile_hinban}")
 
     # ========== 巾木 ==========
-    habaki_block = get_block(text, "巾木", None, 8)
+    habaki_block = get_block(text, "巾木", None, 12)
 
+    habaki_maker_keywords = [
+        "ウッドワン", "WOODONE", "パナソニック", "Panasonic", "大建", "ダイケン",
+        "DAIKEN", "永大", "EIDAI", "リクシル", "LIXIL", "ノダ", "NODA",
+        "東洋テックス", "朝日ウッドテック", "シンコール", "サンゲツ", "TOTO",
+    ]
     habaki_maker = ""
-    for kw in ["ウッドワン", "WOODONE", "パナソニック", "大建", "ダイケン"]:
+    for kw in habaki_maker_keywords:
         if kw in habaki_block:
             habaki_maker = kw
             break
+    # ブロック内に無ければ全文から（巾木がメインの一般的なメーカー優先）
+    if not habaki_maker:
+        for kw in habaki_maker_keywords:
+            if kw in text:
+                habaki_maker = kw
+                break
 
-    # 商品名と色を一括で抽出（巾木行をフルで取得）
-    habaki_full = ""
-    for line in habaki_block.split("\n"):
-        if "巾木" in line and len(line) > 5:
-            habaki_full = line
-            break
+    # 巾木行を全部つなげて取得（複数行にまたがるケースに対応）
+    habaki_full_lines = [line for line in habaki_block.split("\n") if "巾木" in line and len(line) > 4]
+    habaki_full = " ".join(habaki_full_lines) if habaki_full_lines else habaki_block
 
-    habaki_name = ""
-    nm = re.search(r'(ドレスタ\S+シリーズ\S*[型]?|ドレスタ\S+)', habaki_full or habaki_block)
-    habaki_name = nm.group(1) if nm else ""
+    # 商品名: テーブルラベル → 既知パターンの順で探す
+    habaki_name = find_value_in_table(habaki_block, "商品名")
+    if not habaki_name:
+        nm = re.search(
+            r'(ドレスタ\S*シリーズ\S*|ドレスタ\S+|'
+            r'ソフトアートⅡ?巾木\S*|ソフトアート\S*|'
+            r'ピノアース\S*巾木\S*|ピノアース\S*|'
+            r'コンビット\S*|ジョイハードフロアー\S*|'
+            r'スタンダード\S*巾木\S*|MDF巾木\S*|無垢巾木\S*|'
+            r'Nカラー巾木\S*|新永大巾木\S*|永大巾木\S*|'
+            r'巾木[ⅠⅡⅢⅣⅤ\d]+\S*|'
+            r'\S+巾木[A-Z\d]*)',
+            habaki_full or habaki_block,
+        )
+        habaki_name = nm.group(1) if nm else ""
 
-    habaki_color = ""
-    cm = re.search(r'(パールホワイト|ピュアホワイト|ホワイト|ブラック|ナチュラル|ブラウン|オーク\S*)\S*色?', habaki_full or habaki_block)
-    habaki_color = cm.group(0) if cm else ""
+    # カラー: テーブルラベル → 既知パターンの順で探す
+    habaki_color = find_value_in_table(habaki_block, "カラー") or find_value_in_table(habaki_block, "色")
+    if not habaki_color:
+        cm = re.search(
+            r'(パールホワイト|ピュアホワイト|ホワイトオーク|ホワイト|'
+            r'ブラック|ナチュラル|ブラウン|ダークブラウン|ライトブラウン|'
+            r'メープル|チェリー|ウォールナット|オーク|モカ\w*|'
+            r'チェスナット|オリーブ\w*|マロン|ベージュ|アイボリー|'
+            r'グレー|ライトグレー|ダークグレー|シルバー)\S*色?',
+            habaki_full or habaki_block,
+        )
+        habaki_color = cm.group(0) if cm else ""
 
     if not habaki_maker:
         errors.append({"項目": "巾木（メーカー）", "ルール": "メーカーを記載すること",
@@ -1262,12 +1363,28 @@ with tab_bunjou:
             st.success(f"✅ {uploaded_hare.name}")
 
         st.divider()
+        debug_mode_bunjou = st.checkbox(
+            "🔧 デバッグモード（抽出テキストを表示）", key="debug_mode_bunjou"
+        )
 
         if uploaded_file:
             if st.button("🔍 チェック開始", type="primary", use_container_width=True, key="btn_bunjou"):
                 pdf_bytes = uploaded_file.read()
                 with st.spinner("📄 仕様書を解析中..."):
                     text = extract_text_from_pdf(pdf_bytes)
+
+                if st.session_state.get("debug_mode_bunjou"):
+                    with st.expander("🔧 デバッグ: 抽出された全テキスト", expanded=True):
+                        st.text(f"総文字数: {len(text)}")
+                        st.code(text, language="text")
+                        # 巾木周辺のみをピンポイント表示
+                        for kw in ["内部土間タイル", "内部土間", "巾木"]:
+                            idx = text.find(kw)
+                            if idx != -1:
+                                start = max(0, idx - 50)
+                                end = min(len(text), idx + 600)
+                                st.markdown(f"**「{kw}」周辺（位置 {idx}）:**")
+                                st.code(text[start:end], language="text")
 
                 if not text.strip():
                     st.error("仕様書PDFからテキストを抽出できませんでした。")
