@@ -2,6 +2,16 @@ import streamlit as st
 import pdfplumber
 import io
 import re
+import unicodedata
+
+
+def _normalize(text: str) -> str:
+    """PDF 内の Kangxi 部首文字 (⼟, ⼱⽊, ⾵, ⾊ 等) を CJK 統合漢字へ正規化する。
+    NFKC は U+2F00–U+2FDF / U+F900–U+FAFF などの互換文字を統合形に変換する。"""
+    if not text:
+        return text
+    return unicodedata.normalize("NFKC", text)
+
 
 # ============================================================
 # PDF テキスト抽出
@@ -17,7 +27,7 @@ def extract_text_from_pdf(pdf_bytes: bytes) -> str:
                 for row in table:
                     if row and any(c for c in row if c):
                         parts.append(" | ".join([str(c or "").strip() for c in row]))
-    return "\n".join(parts)
+    return _normalize("\n".join(parts))
 
 
 # ============================================================
@@ -581,34 +591,34 @@ def check_specification(text: str) -> tuple[list, list, dict]:
     habaki_full_lines = [line for line in habaki_block.split("\n") if "巾木" in line and len(line) > 4]
     habaki_full = " ".join(habaki_full_lines) if habaki_full_lines else habaki_block
 
-    # 商品名: テーブルラベル → 既知パターンの順で探す
-    habaki_name = find_value_in_table(habaki_block, "商品名")
+    # 商品名: 巾木行内の既知パターンを優先（誤検出を避けるため範囲を限定）
+    habaki_search_text = habaki_full if habaki_full_lines else habaki_block
+    nm = re.search(
+        r'(ドレスタ\S*シリーズ\S*|ドレスタ\S+|'
+        r'ソフトアートⅡ?巾木\S*|ソフトアート\S*|'
+        r'ピノアース\S*巾木\S*|ピノアース\S*|'
+        r'コンビット\S*|ジョイハードフロアー\S*|'
+        r'スタンダード\S*巾木\S*|MDF巾木\S*|無垢巾木\S*|'
+        r'Nカラー巾木\S*|新永大巾木\S*|永大巾木\S*|'
+        r'巾木[ⅠⅡⅢⅣⅤ\d]+\S*|'
+        r'\S+巾木[A-Z\d]*)',
+        habaki_search_text,
+    )
+    habaki_name = nm.group(1) if nm else ""
     if not habaki_name:
-        nm = re.search(
-            r'(ドレスタ\S*シリーズ\S*|ドレスタ\S+|'
-            r'ソフトアートⅡ?巾木\S*|ソフトアート\S*|'
-            r'ピノアース\S*巾木\S*|ピノアース\S*|'
-            r'コンビット\S*|ジョイハードフロアー\S*|'
-            r'スタンダード\S*巾木\S*|MDF巾木\S*|無垢巾木\S*|'
-            r'Nカラー巾木\S*|新永大巾木\S*|永大巾木\S*|'
-            r'巾木[ⅠⅡⅢⅣⅤ\d]+\S*|'
-            r'\S+巾木[A-Z\d]*)',
-            habaki_full or habaki_block,
-        )
-        habaki_name = nm.group(1) if nm else ""
+        # 巾木行のみでテーブル形式の '商品名' ラベルを試す
+        habaki_name = find_value_in_table(habaki_search_text, "商品名")
 
-    # カラー: テーブルラベル → 既知パターンの順で探す
-    habaki_color = find_value_in_table(habaki_block, "カラー") or find_value_in_table(habaki_block, "色")
-    if not habaki_color:
-        cm = re.search(
-            r'(パールホワイト|ピュアホワイト|ホワイトオーク|ホワイト|'
-            r'ブラック|ナチュラル|ブラウン|ダークブラウン|ライトブラウン|'
-            r'メープル|チェリー|ウォールナット|オーク|モカ\w*|'
-            r'チェスナット|オリーブ\w*|マロン|ベージュ|アイボリー|'
-            r'グレー|ライトグレー|ダークグレー|シルバー)\S*色?',
-            habaki_full or habaki_block,
-        )
-        habaki_color = cm.group(0) if cm else ""
+    # カラー: 巾木行のみで検索（玄関ドアの扉色などの誤検出を避ける）
+    cm = re.search(
+        r'(オフホワイト|パールホワイト|ピュアホワイト|ホワイトオーク|ホワイト|'
+        r'ブラック|ナチュラル|ブラウン|ダークブラウン|ライトブラウン|'
+        r'メープル|チェリー|ウォールナット|オーク|モカ\w*|'
+        r'チェスナット|オリーブ\w*|マロン|ベージュ|アイボリー|'
+        r'ライトグレー|ダークグレー|グレー|シルバー)\S*色?',
+        habaki_search_text,
+    )
+    habaki_color = cm.group(0) if cm else ""
 
     if not habaki_maker:
         errors.append({"項目": "巾木（メーカー）", "ルール": "メーカーを記載すること",
@@ -920,7 +930,7 @@ def build_chubun_lookup(pdf_bytes: bytes) -> dict:
     with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
         for page in pdf.pages:
             # 物件名は extract_text から取得（新築工事を含む行を優先）
-            raw = page.extract_text(x_tolerance=3, y_tolerance=3) or ""
+            raw = _normalize(page.extract_text(x_tolerance=3, y_tolerance=3) or "")
             m = re.search(r'(\S+\s+新築工事)', raw)
             if m and "_物件名" not in lookup:
                 lookup["_物件名"] = m.group(0).strip()
@@ -945,7 +955,7 @@ def build_chubun_lookup(pdf_bytes: bytes) -> dict:
                     if not row or not any(c for c in row if c):
                         continue
 
-                    cells = [str(c or "").strip() for c in row]
+                    cells = [_normalize(str(c or "").strip()) for c in row]
                     while len(cells) < 16:
                         cells.append("")
 
